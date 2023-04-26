@@ -1,6 +1,6 @@
 #### Problem description
 A robot during its motion scans the area. To prevent collision it stops in front of an obstacle. 
-Unfortunately, there are situations when floor points are considered as obstacles (false positive obstacle detection), and robots stops. 
+Unfortunately, there are situations when floor points are considered as obstacles (false positive obstacle detection), and robot stops. 
 So there is a fundamental need to filter these points out of the point cloud.
 
 `ros2 run lidar2occupancy lidar2occupancy`
