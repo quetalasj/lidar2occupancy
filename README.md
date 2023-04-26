@@ -1,8 +1,9 @@
 #### Problem description
-When Robot drives around, the lidar scans the area and gets points. 
-To prevent collision robot stops in front of the obstacle (points in a point cloud). 
-Unfortunately, there are situations when points from floor are considered an obstacle, and robots stop. 
+A robot during its motion scans the area. To prevent collision it stops in front of an obstacle. 
+Unfortunately, there are situations when floor points are considered as obstacles (false positive obstacle detection), and robots stops. 
 So there is a fundamental need to filter these points out of the point cloud.
+
+`ros2 run lidar2occupancy lidar2occupancy`
 
 #### Result
 ![alt text](result.png)
