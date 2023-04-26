@@ -2,8 +2,6 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from rclpy.qos import qos_profile_system_default
-from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
-from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs_py.point_cloud2 import read_points, create_cloud_xyz32
@@ -26,6 +24,7 @@ class Lidar2Occupancy(Node):
         self.transformation[:3, :3] = R.from_euler('x', 25, degrees=True).as_matrix()
         self._initial_transform = np.copy(self.transformation)
         self._is_first_frame = True
+        # ROS stuff
         self.subscription = self.create_subscription(PointCloud2, '/points', self.listener_callback,
                                                      qos_profile_system_default)
         self._coarse_transform_pub = self.create_publisher(PointCloud2, '/coarse_transform_pts', qos_profile_system_default)
@@ -37,26 +36,28 @@ class Lidar2Occupancy(Node):
         self._projected_pts_pub_ring = self.create_publisher(PointCloud2, '/projected_pts_ring', qos_profile_system_default)
         self._scan_points_pub = self.create_publisher(PointCloud2, '/scan_points', qos_profile_system_default)
         self._image_pub = self.create_publisher(Image, "/image", qos_profile_system_default)
-        self._image2_pub = self.create_publisher(Image, "/image2", qos_profile_system_default)
         # image frame
         self.cv_bridge = CvBridge()
         self._image = np.zeros(np.round((4 / 0.05, 4 / 0.05)).astype(int)).astype(np.uint8)
         # occupancy grid
+        self._occupancy = 0.5 * np.ones(np.round((4 / 0.05, 4 / 0.05)).astype(int))
         self.map_publisher = self.create_publisher(
             OccupancyGrid,
             '/occupancy_grid',
             qos_profile_system_default
         )
+
     def listener_callback(self, msg):
+        """program main loop"""
         lidar_data = read_points(msg)
         np_pts = np.array([lidar_data['x'], lidar_data['y'], lidar_data['z']])
         if self._is_first_frame:
             self._is_first_frame = False
             self.refine_transformation(np_pts)
-
+        # orient parallel to the ground
         aligned_pts = np_pts.T @ self.transformation[:3, :3] + self.transformation[:3, -1]
         _, floor_np, no_floor_np = self.find_floor(aligned_pts, 0.1)
-
+        # crop to the robot ROI
         processed_pts_np = no_floor_np[(no_floor_np[:, -1] > 0.) *
                                        (np.abs(no_floor_np[:, -1]) < 2.) *
                                        (np.abs(no_floor_np[:, 0]) < 2.) *
@@ -74,7 +75,7 @@ class Lidar2Occupancy(Node):
         projected_pcd = o3d.geometry.PointCloud(
             o3d.utility.Vector3dVector(projected_pts_np)
         )
-
+        # discretize with 0.05 m
         projected_pcd = projected_pcd.voxel_down_sample(0.05)
         discretized_pts_np = np.copy(np.asarray(projected_pcd.points))
         discretized_pts_np[:, -1] = 0
@@ -101,30 +102,35 @@ class Lidar2Occupancy(Node):
                 first_obstacle = np.argmin(depths[sector_pts])
                 scans2d.append(discretized_pts_np[sector_pts][first_obstacle])
         lidar_scan = np.array(scans2d)
-
+        # Occupancy grid pipeline
         measured_cells = self.bresenham(lidar_scan)
         # create occupancy grid
-        occupancy_grid = np.copy(self._image)
+        occupancy_grid = np.copy(self._occupancy)
         for free_cells in measured_cells:
-            occupancy_grid[free_cells[0], free_cells[1]] = 127
-
-        # visualize all results
-        # coarse_transform_msg = create_cloud_xyz32(
-        #     Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
-        #     np_pts.T @ self._initial_transform[:3, :3] + self._initial_transform[:3, -1]
-        # )
-        # fine_transform_msg = create_cloud_xyz32(
-        #     Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
-        #     aligned_pts
-        # )
-        # floor_msg = create_cloud_xyz32(
-        #     Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
-        #     floor_np
-        # )
-        # no_floor_msg = create_cloud_xyz32(
-        #     Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
-        #     no_floor_np
-        # )
+            current_odd = occupancy_grid[free_cells[0], free_cells[1]] / (1 - occupancy_grid[free_cells[0], free_cells[1]] + 1e-6)
+            laser_odd = np.ones(len(free_cells[0])) * 0.9/0.1
+            laser_odd[-1] = 0.1 / 0.9
+            new_odd = np.log(current_odd + 1e-12) + np.log(laser_odd + 1e-12)   # logit(prior)=0
+            occupancy_grid[free_cells[0], free_cells[1]] = 1 - 1 / (1 + np.exp(new_odd))
+        self._occupancy = np.copy(occupancy_grid)
+        occupancy_grid = (occupancy_grid * 255).astype(np.int8)
+        # visualize all results: uncomment the desired ones
+        coarse_transform_msg = create_cloud_xyz32(
+            Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
+            np_pts.T @ self._initial_transform[:3, :3] + self._initial_transform[:3, -1]
+        )
+        fine_transform_msg = create_cloud_xyz32(
+            Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
+            aligned_pts
+        )
+        floor_msg = create_cloud_xyz32(
+            Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
+            floor_np
+        )
+        no_floor_msg = create_cloud_xyz32(
+            Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
+            no_floor_np
+        )
         processed_pts_msg = create_cloud_xyz32(
             Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
             np.asarray(processed_pcd.points)
@@ -142,8 +148,7 @@ class Lidar2Occupancy(Node):
             Header(stamp=self.get_clock().now().to_msg(), frame_id=msg.header.frame_id),
             lidar_scan
         )
-        # import pdb
-        # pdb.set_trace()
+
         occupancy_grid_msg = OccupancyGrid()
         occupancy_grid_msg.header.stamp = self.get_clock().now().to_msg()
         occupancy_grid_msg.header.frame_id = msg.header.frame_id
@@ -153,22 +158,19 @@ class Lidar2Occupancy(Node):
         occupancy_grid_msg.info.origin.position.x = -2.
         occupancy_grid_msg.info.origin.position.y = -2.
         occupancy_grid_msg.data = occupancy_grid.reshape(-1).tolist()
-        # import pdb
-        # pdb.set_trace()
-        # new_msg.data = msg.data
-        # msg.header.stamp = self.get_clock().now().to_msg()
-        # self._coarse_transform_pub.publish(coarse_transform_msg)
-        # self._fine_transform_pub.publish(fine_transform_msg)
-        # self._floor_pub.publish(floor_msg)
-        # self._no_floor_pub.publish(no_floor_msg)
+
+        self._coarse_transform_pub.publish(coarse_transform_msg)
+        self._fine_transform_pub.publish(fine_transform_msg)
+        self._floor_pub.publish(floor_msg)
+        self._no_floor_pub.publish(no_floor_msg)
         self._processed_pts_pub.publish(processed_pts_msg)
         self._projected_pts_pub.publish(projected_pts_msg)
         self._projected_pts_pub_ring.publish(projected_pts_msg_ring)
         self._scan_points_pub.publish(scan_points_msg)
 
         self._image_pub.publish(self.cv_bridge.cv2_to_imgmsg(image, "mono8"))
-        self._image2_pub.publish(self.cv_bridge.cv2_to_imgmsg(occupancy_grid, "mono8"))
         self.map_publisher.publish(occupancy_grid_msg)
+
     def vectors_angle(self, a, b=np.array([0, 1])):
         """ Estimates angles between 2d vectors"""
         a_norm = a / np.linalg.norm(a)
@@ -184,7 +186,6 @@ class Lidar2Occupancy(Node):
         plane_model, inliers = pcd.segment_plane(distance_threshold=0.05, ransac_n=3, num_iterations=10000)
         floor_np = approximately_floor[inliers]
         no_floor_mask = np.ones(lidar_scan_np.shape[0], dtype=bool)
-        # no_floor_mask[mask][inliers] = False
         np.put_along_axis(no_floor_mask[mask], np.array(inliers), False, axis=0)
         all_indices = np.arange(lidar_scan_np.shape[0])
         mask_indices = np.copy(all_indices[mask])
@@ -217,6 +218,7 @@ class Lidar2Occupancy(Node):
             rr, cc = skimage.draw.line(39, 39, end_point[1], end_point[0])
             coords.append((rr, cc))
         return coords
+
 
 def main(args=None):
     rclpy.init(args=args)
